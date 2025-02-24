@@ -1,0 +1,949 @@
+---
+title: "Analysis of eGFR Dynamics Using Linear and Segmented Regression"
+date: "24.02.2025"
+author: "Pavel Grobushkin"
+editor: visual
+format:
+  html:
+    code-fold: true
+    embed-resourses: true
+    toc: true
+---
+
+# Introduction
+
+This code analyzes the dynamics of the estimated glomerular filtration rate (eGFR) in patients. It identifies changepoints (or breakpoints) in eGFR data and calculates the slopes of eGFR changes over time using segmented regression models. As the output, it provides "*changepoint_summary*" dataframe with the slope, estimated changepoint date, lower and upper bound of the 95% confidence interval for the changepoint date and the nearest eGFR value to the changepoint date for all the patients. Also, it provides an "*excluded_patients*" vector of excluded patients.
+
+## Load necessary libraries
+
+```{r}
+if (requireNamespace("renv", quietly = TRUE)) renv::restore(prompt = FALSE)
+library(segmented)  # For segmented regression
+library(dplyr)      # For data manipulation
+library(readr)      # For reading CSV files
+library(purrr)      # For functional programming
+```
+
+# Data Loading and Preprocessing
+
+## Data Loading
+
+```{r}
+# Define file path
+file_path <- "PavelData.csv"
+
+# Load dataset
+Data <- read_csv(file_path)
+```
+
+## Preprocessing
+
+In this case, we filter the data to use only the part that represents eGFR decline before the tolvaptan treatment starts. However, the main code can be applied to analyze any type of time-series data to detect changepoints in both declining and rising eGFR levels.
+
+```{r}
+# Convert date columns to Date type for proper handling
+Data$date <- as.Date(Data$date)
+Data$tolv_start <- as.Date(Data$tolv_start)
+
+# Remove unnecessary columns
+Data$exam <- NULL
+Data$gender <- NULL
+
+# Filter rows where 'tolv' column is TRUE
+Data <- subset(Data, tolv == TRUE)
+
+# Remove the 'tolv' column as it's no longer needed
+Data$tolv <- NULL
+
+# Removing duplicated entries by selecting rows where tolv_type is 'before'
+# This will keep the first occurrence and remove duplicates based on patient and date
+Data_filtered <- Data %>%
+  filter(tolv_type == 'before') %>%
+  group_by(patient, date) %>%
+  distinct(.keep_all = TRUE) %>%
+  ungroup()
+
+# Select patients who have at least 3 measurements before the intervention
+Data_filtered <- Data_filtered %>%
+  group_by(patient) %>%
+  filter(n() >= 3) %>%
+  ungroup()
+
+# Further filtering to include only patients with at least one eGFR measurement below 90
+# in their last three measurements (tail of the data)
+filtered_patients <- Data_filtered %>%
+  group_by(patient) %>%
+  slice_tail(n = 3) %>%
+  filter(any(eGFR <= 90)) %>%
+  ungroup() %>%
+  distinct(patient)
+
+# Final filtering to only include the patients who passed the <90 eGFR condition
+Data_final <- Data_filtered %>%
+  semi_join(filtered_patients, by = "patient")
+
+# Clean-up: Remove unnecessary columns for the final dataset
+Data_final$on_tolv <- NULL
+Data_final$tolv_end <- NULL
+
+# Clean up intermediate data frames from memory
+rm(filtered_patients)
+rm(Data_filtered)
+```
+
+## Functions
+
+### Function to remove close points based on eGFR and date criteria (for the "CREATING A SUBSET WITH MEASUREMENTS FOR ONE PATIENT ONLY" section)
+
+```{r}
+remove_close_points <- function(df) {
+  
+  # Initialize vector to store indices of points to be deleted
+  delete_indices <- integer()
+  
+  # Loop through each row and check if the next point is close based on eGFR and date
+  for (i in 1:(nrow(df) - 1)) {
+    # Calculate the absolute differences for date and eGFR
+    date_diff <- abs(df[i, ]$date - df[i + 1, ]$date)
+    eGFR_diff <- abs(df[i, ]$eGFR - df[i + 1, ]$eGFR)
+    
+    # Mark the points as "close" if eGFR difference < 1 and date difference <= 15 days
+    if (date_diff <= 15 && eGFR_diff < 1) {
+      delete_indices <- c(delete_indices, i)
+    }
+  }
+  
+  # Remove the "close" points if there are any
+  if (length(delete_indices) > 0) {
+    df <- df[-delete_indices, ]
+  }
+  
+  # Return the cleaned dataset
+  return(df)
+}
+```
+
+### Function to dynamically set the number of rows and columns for plotting (for the "CHOOSING THE BEST MODEL" section)
+
+```{r}
+set_plot <- function(num_plots) {
+  
+  # Calculate the number of rows by taking the floor of the square root of the number of plots
+  rows <- floor(sqrt(num_plots))
+  
+  # Calculate the number of columns by dividing the number of plots by the number of rows, then round up to make sure all plots fit.
+  cols <- ceiling(num_plots / rows)
+  
+  # Set the plot layout to a grid with `rows` and `cols`
+  par(mfrow = c(rows, cols))
+}
+```
+
+# Main code
+
+## Setting up parameters
+
+```{r}
+# Creating an empty data frame and vector for the collection of final data 
+changepoint_summary <- data.frame()
+excluded_patients <- c()
+
+# Specifying the maximum number of breakpoints for the analyzed data. The default is set to 2, which is usually sufficient for most eGFR datasets, so you typically don’t need to modify it. However, you can adjust this value if you want the code to calculate the probability of a model with a larger number of changepoints. Keep in mind that the more breakpoints you specify, the greater the impact of outliers on the final model.
+bp_number <- 2
+
+# Segmented models are typically considered less plausible than simple linear models, although they may describe the data at least as well as, if not better than, the linear model. Therefore, I apply a handicap of 1 AIC point to the segmented models. This number can also be changed
+aic_handicap <- 1
+
+# Configuring the control parameters for the segmented regression. See Vito M. R. Muggeo’s 2008 R News paper and the manual for the ‘segmented’ package for details.
+control <- seg.control(n.boot = 100, quant = TRUE, min.nj = 3)
+
+```
+
+**Why AIC, not BIC?**
+
+When there are 8 or more data points, BIC becomes more stringent than AIC. We want to avoid this because, given the limited number of measurements per patient, overfitting is unlikely and we want to minimize the risk of underfitting. Conversely, when there are 7 or fewer data points, AIC is more stringent than BIC. In this case, we choose to use the more stringent AIC to prevent making incorrect complex assumptions based on the presence of possible outliers.
+
+## Main loop to analyze data for each patient
+
+### eGFR decline
+
+This version of the loop automatically identifies the steepest negative slope to determine how fast eGFR is declining. However, since you can manually choose the slope you want to save, this distinction doesn't really matter — you can also use this code to detect slopes that represent how fast eGFR is rising.
+
+```{r}
+# Using "for" to get slopes for each patient
+for (pat in unique(Data_final$patient)) {
+    # Sometimes warnings arise. They should be skipped
+    tryCatch({
+
+    # ====================================================================
+    # 1) CREATING A SUBSET WITH MEASUREMENTS FOR ONE PATIENT ONLY
+    # ====================================================================
+    
+    current_pat <- subset(Data_final, patient == pat)  # Filter data for the current patient
+    current_pat$date <- as.numeric(current_pat$date)  # Convert date to numeric format for remove_close_points function
+    current_pat <- remove_close_points(current_pat)  # Remove close points
+    current_pat$date <- as.Date(current_pat$date)  # Convert back to Date format
+    
+    # ====================================================================
+    # 2) FITTING DIFFERENT MODELS AND CALCULATING AIC FOR THEM
+    # ====================================================================
+    
+    # Initial simple linear regression model
+    initial_model <- lm(eGFR ~ date, data = current_pat)
+    
+    # Creating vector for AIC values for each model: Initial linear regression and segmented models with 1, 2, ..., bp_number breakpoints
+    aic_values <- c(AIC(initial_model), rep(Inf, bp_number))
+    
+    # Store models: [1] initial_model, [2] segmented_model_1, [3] segmented_model_2, etc.
+    models <- c(list(initial_model), replicate(bp_number, NULL, simplify = FALSE))
+    
+    # Fit segmented models with 1 and more breakpoints
+    for (i in 1:bp_number) {
+      tryCatch({
+        segmented_model <- segmented(initial_model, seg.Z = ~ date, control = control, npsi = i)
+        aic_values[i + 1] <- AIC(segmented_model)  # Store AIC value
+        models[[i + 1]] <- segmented_model  # Store the segmented model
+      }, error = function(e) {})
+    }
+    
+    # Sometimes when estimation fails, an lm fit returns. So, if any segmented model has the same AIC as the initial model, invalidate it. 
+    for (i in 2:(bp_number + 1)) {
+      if (aic_values[1] == aic_values[i]) {
+        aic_values[i] <- Inf
+      }
+    }
+    
+    # Select the model with the lowest AIC value
+    best_model_index <- which.min(aic_values)
+    best_model <- models[[best_model_index]]
+    
+    # ====================================================================
+    # 3) CHOOSING THE BEST MODEL
+    # ====================================================================
+    
+    # 3.1) Identifying alternative models with similar AIC values
+    
+    # We look for models with AIC values close to the best model's AIC.
+    # If a model has an AIC within 1 unit of the best AIC, it is considered a viable alternative.
+    good_models_index <- NULL
+    for (i in c(if (best_model_index > 1) 1:(best_model_index - 1), 
+                if (best_model_index < bp_number + 1) (best_model_index + 1):(bp_number + 1))) {
+      if (!is.na(aic_values[i]) && aic_values[best_model_index] >= aic_values[i] - 1) {
+        good_models_index <- c(good_models_index, i)
+      }
+    }
+    
+    # 3.2) Plotting the best model and possible alternatives
+    
+    # Determine the number of plots required: the best model + alternative models
+    num_plots <- length(good_models_index) + 1
+    set_plot(num_plots)  # Adjust the plotting area
+    
+    # Plot the best model first
+    if (best_model_index == 1) {
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+           main = paste(pat, "'s best model is linear"), 
+           xlab = "Date", ylab = "eGFR")
+      abline(best_model, col = "red", lwd = 2)
+    } else {
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+           main = paste(pat, "'s best model has", best_model_index - 1, "changepoint(s)"), 
+           xlab = "Date", ylab = "eGFR")
+      plot(best_model, add = TRUE, col = "red")
+      points.segmented (best_model)
+      lines.segmented (best_model, shift=TRUE)
+    }
+    
+    # Plot the alternative models
+    if (length(good_models_index) > 0) {
+      for (k in 1:length(good_models_index)) {
+        if (good_models_index[k] == 1){
+          plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+            main = paste("Linear model for", pat), 
+            xlab = "Date", ylab = "eGFR")
+          abline(best_model, col = "red", lwd = 2)
+        } else {
+          plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+            main = paste(good_models_index[k] - 1, "changepoint(s) model for", pat),
+            xlab = "Date", ylab = "eGFR")
+          plot(models[[good_models_index[k]]], add = TRUE, col = "red")
+          points.segmented (models[[good_models_index[k]]])
+          lines.segmented (models[[good_models_index[k]]], shift=TRUE)
+          }
+      }
+      
+      # 3.3) Allowing the user to select a preferred model
+      repeat {
+        choice <- readline(prompt = paste(
+          "Based on AIC values, all of these models are plausible. Enter a number from 1 to", 
+          length(good_models_index) + 1, "to choose the model that you prefer.\n",
+          "Count from left to right, from top to bottom. 1 represents the model in the (top-)left corner, and", 
+          length(good_models_index) + 1, "is the (bottom-)right model.\n"
+        ))
+        
+        choice <- as.numeric(choice)
+        
+        if (!is.na(choice) && is.numeric(choice)) {
+          if (choice == 1) {
+            cat("You've chosen the first model\n")
+            break
+          } else if (choice >= 2 && choice <= length(good_models_index) + 1) {
+            best_model <- models[[good_models_index[(choice - 1)]]]
+            cat("You've chosen model number", choice, "\n")
+            break
+          }
+        }
+        
+        cat("Invalid choice. Please enter a number from 1 to", length(good_models_index) + 1, "\n")
+      }
+    }
+    
+    # Reset plotting layout to default
+    par(mfrow = c(1, 1))
+    
+    # 3.4) Extracting the best slope from the selected model
+    
+    # If a simple lm (initial model) shows the best fit, we calculate it's slope
+    if (identical(best_model, models[[1]])) {
+      coefficients <- coef(best_model)
+      best_slope <- coefficients[2]
+      print(paste("The best model for", pat, "is a linear regeression. It's slope =", best_slope))
+      
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", main = paste("Linear Regression model for", pat), xlab = "Date", ylab = "eGFR")
+      abline(initial_model, col = "red", lwd = 2) 
+      
+      # 3.5) Confirming the selected slope with the user
+      repeat {
+        continue <- readline(prompt = paste(
+          " If you agree, press Enter to continue. If you want to avoid this patient, press 'n'.\n",
+          "If you want to break the cycle, press Esc.\n\n"
+        ))
+        
+        if (tolower(continue) == "n") {
+          excluded_patients <- c(excluded_patients, pat)
+          cat("Patient", pat, "is not included in the final dataset.\n")
+          break
+        } else if ((continue)==""){
+          # Store extracted data
+          new_row <- data.frame(patient = pat, slope = best_slope)
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          break
+        }
+      }
+      
+      # If the best model has changepoints, extract all segment slopes 
+    } else { 
+      all_slopes <- as.data.frame(slope(best_model))
+      colnames(all_slopes) <- c("Est.", "St.Err.", "t value", "CI(95%).l", "CI(95%).u")
+      print(all_slopes)
+      
+      # Automatically pick the steepest (most negative) slope
+      best_slope <- min(all_slopes$Est.)
+      min_index <- which.min(all_slopes$Est.)
+      min_row_name <- rownames(all_slopes)[min_index]
+      
+      print(paste("The slope that you need for", pat, "is probably", min_row_name, best_slope))
+      
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", main = paste("Segmented Model for", pat), xlab = "Date", ylab = "eGFR")
+      plot(best_model, add = TRUE, col = "red")
+      points.segmented (best_model)
+      lines.segmented (best_model, shift=TRUE)
+      
+      # 3.5) Confirming the selected slope with the user
+      
+      repeat {
+        continue <- readline(prompt = paste(
+          " If you agree, press Enter to continue. If you want to avoid this patient, press 'n'.\n",
+          "If you want to choose another slope, enter the number from 1 to", nrow(all_slopes), "\n",
+          "If you want to break the cycle, press Esc.\n\n"
+        ))
+        
+        if (tolower(continue) == "n") {
+          # We exclude the patient
+          excluded_patients <- c(excluded_patients, pat)
+          cat("Patient", pat, "is not included in the final dataset.\n")
+          break
+          
+        } else if (as.integer(continue) %in% 2:nrow(all_slopes)) {
+          continue <- as.integer(continue)
+          # Extract changepoint date and CI bounds as dates
+          changepoint_dates <- as.Date(confint.segmented(best_model))
+          # Store extracted data
+          new_row <- data.frame(
+            patient = pat, 
+            # Store the slope value and its 95% confidence intervals  
+            slope = all_slopes[continue, 1],
+            slope_CI95_lower = all_slopes[continue, 4],
+            slope_CI95_upper = all_slopes[continue, 5],
+            # Store the changepoint at the beginning of the chosen line
+            changepoint_date = changepoint_dates[(continue-1)], 
+            # Store the 95% confidence intervals of the changepoint
+            changepoint_CI95_lower = changepoint_dates[(continue-1)+(nrow(all_slopes)-1)], 
+            changepoint_CI95_upper = changepoint_dates[(continue-1)+2*(nrow(all_slopes)-1)],
+            # Calculate predicted eGFR value for the predicted changepoint 
+            predicted_eGFR_for_changepoint = predict (best_model, data.frame(date = changepoint_dates[(continue-1)]))
+          )
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the slope number", continue, "for patient", pat, "\n\n")
+          break
+          
+        } else if (min_index!=1 && (continue)==""){
+          # Otherwise, add the automatically selected slope to the final dataset
+          # Extract changepoint date and CI bounds as dates
+          changepoint_dates <- as.Date(confint.segmented(best_model))
+          new_row <- data.frame(
+            patient = pat, 
+            # Store the slope value and its 95% confidence intervals  
+            slope = all_slopes[min_index, 1],
+            slope_CI95_lower = all_slopes[min_index, 4],
+            slope_CI95_upper = all_slopes[min_index, 5],
+            # Store the changepoint at the beginning of the chosen line
+            changepoint_date = changepoint_dates[(min_index-1)], 
+            # Store the 95% confidence intervals of the changepoint
+            changepoint_CI95_lower = changepoint_dates[(min_index-1)+(nrow(all_slopes)-1)], 
+            changepoint_CI95_upper = changepoint_dates[(min_index-1)+2*(nrow(all_slopes)-1)],
+            # Calculate predicted eGFR value for the predicted changepoint 
+            predicted_eGFR_for_changepoint = predict (best_model, data.frame(date = changepoint_dates[(min_index-1)]))
+          )
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the", min_row_name, "for patient", pat, "\n\n")
+          break
+          
+        } else if ((continue)=="1" | (min_index==1 && (continue)=="") ){
+          # If a user picks the first slope in a segmented model, we store only the slope value
+          new_row <- data.frame(patient = pat, slope = all_slopes[1, 1])
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the slope number 1 for patient", pat, "\n\n")
+          break
+        }
+      }
+    }
+        # Clean up variables used in this iteration
+        rm(aic_values, best_model_index, best_model, good_models_index, models, all_slopes, best_slope, new_row, choice, continue, i, k, min_index, min_row_name, num_plots, selected_slope, user_input, changepoint_dates, coefficients, initial_model, segmented_model)
+    }, error = function(e) {
+        cat("ERROR:", conditionMessage(e), "\n")
+    })
+}
+```
+
+### eGFR increase
+
+The only change from the previous code is that in this version of the loop, it automatically identifies the steepest positive (not negative) slope to determine how fast eGFR is rising. However, again, since you can manually choose the slope you want to save, this distinction doesn't really matter. **Since both loops use the same variables to write the final dataframe, be cautious to save it after each loop (to avoid overwriting it with the other).**
+
+```{r}
+# Using "for" to get slopes for each patient
+for (pat in unique(Data_final$patient)) {
+  # Sometimes warnings arise. They should be skipped
+  tryCatch({
+    
+    # ====================================================================
+    # 1) CREATING A SUBSET WITH MEASUREMENTS FOR ONE PATIENT ONLY
+    # ====================================================================
+    
+    current_pat <- subset(Data_final, patient == pat)  # Filter data for the current patient
+    current_pat$date <- as.numeric(current_pat$date)  # Convert date to numeric format for remove_close_points function
+    current_pat <- remove_close_points(current_pat)  # Remove close points
+    current_pat$date <- as.Date(current_pat$date)  # Convert back to Date format
+    
+    # ====================================================================
+    # 2) FITTING DIFFERENT MODELS AND CALCULATING AIC FOR THEM
+    # ====================================================================
+    
+    # Initial simple linear regression model
+    initial_model <- lm(eGFR ~ date, data = current_pat)
+    
+    # Creating vector for AIC values for each model: Initial linear regression and segmented models with 1, 2, ..., bp_number breakpoints
+    aic_values <- c(AIC(initial_model), rep(Inf, bp_number))
+    
+    # Store models: [1] initial_model, [2] segmented_model_1, [3] segmented_model_2, etc.
+    models <- c(list(initial_model), replicate(bp_number, NULL, simplify = FALSE))
+    
+    # Fit segmented models with 1 and more breakpoints
+    for (i in 1:bp_number) {
+      tryCatch({
+        segmented_model <- segmented(initial_model, seg.Z = ~ date, control = control, npsi = i)
+        aic_values[i + 1] <- AIC(segmented_model)  # Store AIC value
+        models[[i + 1]] <- segmented_model  # Store the segmented model
+      }, error = function(e) {})
+    }
+    
+    # Sometimes when estimation fails, an lm fit returns. So, if any segmented model has the same AIC as the initial model, invalidate it. 
+    for (i in 2:(bp_number + 1)) {
+      if (aic_values[1] == aic_values[i]) {
+        aic_values[i] <- Inf
+      }
+    }
+    
+    # Select the model with the lowest AIC value
+    best_model_index <- which.min(aic_values)
+    best_model <- models[[best_model_index]]
+    
+    # ====================================================================
+    # 3) CHOOSING THE BEST MODEL
+    # ====================================================================
+    
+    # 3.1) Identifying alternative models with similar AIC values
+    
+    # We look for models with AIC values close to the best model's AIC.
+    # If a model has an AIC within 1 unit of the best AIC, it is considered a viable alternative.
+    good_models_index <- NULL
+    for (i in c(if (best_model_index > 1) 1:(best_model_index - 1), 
+                if (best_model_index < bp_number + 1) (best_model_index + 1):(bp_number + 1))) {
+      if (!is.na(aic_values[i]) && aic_values[best_model_index] >= aic_values[i] - 1) {
+        good_models_index <- c(good_models_index, i)
+      }
+    }
+    
+    # 3.2) Plotting the best model and possible alternatives
+    
+    # Determine the number of plots required: the best model + alternative models
+    num_plots <- length(good_models_index) + 1
+    set_plot(num_plots)  # Adjust the plotting area
+    
+    # Plot the best model first
+    if (best_model_index == 1) {
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+           main = paste(pat, "'s best model is linear"), 
+           xlab = "Date", ylab = "eGFR")
+      abline(best_model, col = "red", lwd = 2)
+    } else {
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+           main = paste(pat, "'s best model has", best_model_index - 1, "changepoint(s)"), 
+           xlab = "Date", ylab = "eGFR")
+      plot(best_model, add = TRUE, col = "red")
+      points.segmented (best_model)
+      lines.segmented (best_model, shift=TRUE)
+    }
+    
+    # Plot the alternative models
+    if (length(good_models_index) > 0) {
+      for (k in 1:length(good_models_index)) {
+        if (good_models_index[k] == 1){
+          plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+            main = paste("Linear model for", pat), 
+            xlab = "Date", ylab = "eGFR")
+          abline(best_model, col = "red", lwd = 2)
+        } else {
+          plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+            main = paste(good_models_index[k] - 1, "changepoint(s) model for", pat),
+            xlab = "Date", ylab = "eGFR")
+          plot(models[[good_models_index[k]]], add = TRUE, col = "red")
+          points.segmented (models[[good_models_index[k]]])
+          lines.segmented (models[[good_models_index[k]]], shift=TRUE)
+          }
+      }
+      
+      # 3.3) Allowing the user to select a preferred model
+      repeat {
+        choice <- readline(prompt = paste(
+          "Based on AIC values, all of these models are plausible. Enter a number from 1 to", 
+          length(good_models_index) + 1, "to choose the model that you prefer.\n",
+          "Count from left to right, from top to bottom. 1 represents the model in the (top-)left corner, and", 
+          length(good_models_index) + 1, "is the (bottom-)right model.\n"
+        ))
+        
+        choice <- as.numeric(choice)
+        
+        if (!is.na(choice) && is.numeric(choice)) {
+          if (choice == 1) {
+            cat("You've chosen the first model\n")
+            break
+          } else if (choice >= 2 && choice <= length(good_models_index) + 1) {
+            best_model <- models[[good_models_index[(choice - 1)]]]
+            cat("You've chosen model number", choice, "\n")
+            break
+          }
+        }
+        
+        cat("Invalid choice. Please enter a number from 1 to", length(good_models_index) + 1, "\n")
+      }
+    }
+    
+    # Reset plotting layout to default
+    par(mfrow = c(1, 1))
+    
+    # 3.4) Extracting the best slope from the selected model
+    
+    # If a simple lm (initial model) shows the best fit, we calculate it's slope
+    if (identical(best_model, models[[1]])) {
+      coefficients <- coef(best_model)
+      best_slope <- coefficients[2]
+      print(paste("The best model for", pat, "is a linear regeression. It's slope =", best_slope))
+      
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", main = paste("Linear Regression model for", pat), xlab = "Date", ylab = "eGFR")
+      abline(initial_model, col = "red", lwd = 2) 
+      
+      # 3.5) Confirming the selected slope with the user
+      repeat {
+        continue <- readline(prompt = paste(
+          " If you agree, press Enter to continue. If you want to avoid this patient, press 'n'.\n",
+          "If you want to break the cycle, press Esc.\n\n"
+        ))
+        
+        if (tolower(continue) == "n") {
+          excluded_patients <- c(excluded_patients, pat)
+          cat("Patient", pat, "is not included in the final dataset.\n")
+          break
+        } else if ((continue)==""){
+          # Store extracted data
+          new_row <- data.frame(patient = pat, slope = best_slope)
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          break
+        }
+      }
+      
+      # If the best model has changepoints, extract all segment slopes 
+    } else { 
+      all_slopes <- as.data.frame(slope(best_model))
+      colnames(all_slopes) <- c("Est.", "St.Err.", "t value", "CI(95%).l", "CI(95%).u")
+      print(all_slopes)
+      
+      # Automatically pick the steepest (most negative) slope
+      best_slope <- max(all_slopes$Est.)
+      max_index <- which.max(all_slopes$Est.)
+      max_row_name <- rownames(all_slopes)[max_index]
+      
+      print(paste("The slope that you need for", pat, "is probably", max_row_name, best_slope))
+      
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", main = paste("Segmented Model for", pat), xlab = "Date", ylab = "eGFR")
+      plot(best_model, add = TRUE, col = "red")
+      points.segmented (best_model)
+      lines.segmented (best_model, shift=TRUE)
+      
+      # 3.5) Confirming the selected slope with the user
+      
+      repeat {
+        continue <- readline(prompt = paste(
+          " If you agree, press Enter to continue. If you want to avoid this patient, press 'n'.\n",
+          "If you want to choose another slope, enter the number from 1 to", nrow(all_slopes), "\n",
+          "If you want to break the cycle, press Esc.\n\n"
+        ))
+        
+        if (tolower(continue) == "n") {
+          # We exclude the patient
+          excluded_patients <- c(excluded_patients, pat)
+          cat("Patient", pat, "is not included in the final dataset.\n")
+          break
+          
+        } else if (as.integer(continue) %in% 2:nrow(all_slopes)) {
+          continue <- as.integer(continue)
+          # Extract changepoint date and CI bounds as dates
+          changepoint_dates <- as.Date(confint.segmented(best_model))
+          # Store extracted data
+          new_row <- data.frame(
+            patient = pat, 
+            # Store the slope value and its 95% confidence intervals  
+            slope = all_slopes[continue, 1],
+            slope_CI95_lower = all_slopes[continue, 4],
+            slope_CI95_upper = all_slopes[continue, 5],
+            # Store the changepoint at the beginning of the chosen line
+            changepoint_date = changepoint_dates[(continue-1)], 
+            # Store the 95% confidence intervals of the changepoint
+            changepoint_CI95_lower = changepoint_dates[(continue-1)+(nrow(all_slopes)-1)], 
+            changepoint_CI95_upper = changepoint_dates[(continue-1)+2*(nrow(all_slopes)-1)],
+            # Calculate predicted eGFR value for the predicted changepoint 
+            predicted_eGFR_for_changepoint = predict (best_model, data.frame(date = changepoint_dates[(continue-1)]))
+          )
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the slope number", continue, "for patient", pat, "\n\n")
+          break
+          
+        } else if (max_index!=1 && (continue)==""){
+          # Otherwise, add the automatically selected slope to the final dataset
+          # Extract changepoint date and CI bounds as dates
+          changepoint_dates <- as.Date(confint.segmented(best_model))
+          new_row <- data.frame(
+            patient = pat, 
+            # Store the slope value and its 95% confidence intervals  
+            slope = all_slopes[max_index, 1],
+            slope_CI95_lower = all_slopes[max_index, 4],
+            slope_CI95_upper = all_slopes[max_index, 5],
+            # Store the changepoint at the beginning of the chosen line
+            changepoint_date = changepoint_dates[(max_index-1)], 
+            # Store the 95% confidence intervals of the changepoint
+            changepoint_CI95_lower = changepoint_dates[(max_index-1)+(nrow(all_slopes)-1)], 
+            changepoint_CI95_upper = changepoint_dates[(max_index-1)+2*(nrow(all_slopes)-1)],
+            # Calculate predicted eGFR value for the predicted changepoint 
+            predicted_eGFR_for_changepoint = predict (best_model, data.frame(date = changepoint_dates[(max_index-1)]))
+          )
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the", max_row_name, "for patient", pat, "\n\n")
+          break
+          
+        } else if ((continue)=="1" | (max_index==1 && (continue)=="") ){
+          # If a user picks the first slope in a segmented model, we store only the slope value
+          new_row <- data.frame(patient = pat, slope = all_slopes[1, 1])
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the slope number 1 for patient", pat, "\n\n")
+          break
+        }
+      }
+    }
+    # Clean up variables used in this iteration
+    rm(aic_values, best_model_index, best_model, good_models_index, models, all_slopes, best_slope, new_row, choice, continue, i, k, max_index, max_row_name, num_plots, selected_slope, user_input, changepoint_dates, coefficients, initial_model, segmented_model)
+  }, error = function(e) {
+    cat("ERROR:", conditionMessage(e), "\n")
+  })
+}
+```
+
+### Single patient eGFR analysis
+
+Non-loop code for analyzing data from a single patient, mostly for troubleshooting.
+
+```{r}
+
+pat = "KO-0798"
+changepoint_summary <- data.frame()
+# Sometimes warnings arise. They should be skipped
+  tryCatch({
+    
+    # ====================================================================
+    # 1) CREATING A SUBSET WITH MEASUREMENTS FOR ONE PATIENT ONLY
+    # ====================================================================
+    
+    current_pat <- subset(Data_final, patient == pat)  # Filter data for the current patient
+    current_pat$date <- as.numeric(current_pat$date)  # Convert date to numeric format for remove_close_points function
+    current_pat <- remove_close_points(current_pat)  # Remove close points
+    current_pat$date <- as.Date(current_pat$date)  # Convert back to Date format
+    
+    # ====================================================================
+    # 2) FITTING DIFFERENT MODELS AND CALCULATING AIC FOR THEM
+    # ====================================================================
+    
+    # Initial simple linear regression model
+    initial_model <- lm(eGFR ~ date, data = current_pat)
+    
+    # Creating vector for AIC values for each model: Initial linear regression and segmented models with 1, 2, ..., bp_number breakpoints
+    aic_values <- c(AIC(initial_model), rep(Inf, bp_number))
+    
+    # Store models: [1] initial_model, [2] segmented_model_1, [3] segmented_model_2, etc.
+    models <- c(list(initial_model), replicate(bp_number, NULL, simplify = FALSE))
+    
+    # Fit segmented models with 1 and more breakpoints
+    for (i in 1:bp_number) {
+      tryCatch({
+        segmented_model <- segmented(initial_model, seg.Z = ~ date, control = control, npsi = i)
+        aic_values[i + 1] <- AIC(segmented_model)  # Store AIC value
+        models[[i + 1]] <- segmented_model  # Store the segmented model
+      }, error = function(e) {})
+    }
+    
+    # Sometimes when estimation fails, an lm fit returns. So, if any segmented model has the same AIC as the initial model, invalidate it. 
+    for (i in 2:(bp_number + 1)) {
+      if (aic_values[1] == aic_values[i]) {
+        aic_values[i] <- Inf
+      }
+    }
+    
+    # Select the model with the lowest AIC value
+    best_model_index <- which.min(aic_values)
+    best_model <- models[[best_model_index]]
+    
+    # ====================================================================
+    # 3) CHOOSING THE BEST MODEL
+    # ====================================================================
+    
+    # 3.1) Identifying alternative models with similar AIC values
+    
+    # We look for models with AIC values close to the best model's AIC.
+    # If a model has an AIC within 1 unit of the best AIC, it is considered a viable alternative.
+    good_models_index <- NULL
+    for (i in c(if (best_model_index > 1) 1:(best_model_index - 1), 
+                if (best_model_index < bp_number + 1) (best_model_index + 1):(bp_number + 1))) {
+      if (!is.na(aic_values[i]) && aic_values[best_model_index] >= aic_values[i] - 1) {
+        good_models_index <- c(good_models_index, i)
+      }
+    }
+    
+    # 3.2) Plotting the best model and possible alternatives
+    
+    # Determine the number of plots required: the best model + alternative models
+    num_plots <- length(good_models_index) + 1
+    set_plot(num_plots)  # Adjust the plotting area
+    
+    # Plot the best model first
+    if (best_model_index == 1) {
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+           main = paste(pat, "'s best model is linear"), 
+           xlab = "Date", ylab = "eGFR")
+      abline(best_model, col = "red", lwd = 2)
+    } else {
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+           main = paste(pat, "'s best model has", best_model_index - 1, "changepoint(s)"), 
+           xlab = "Date", ylab = "eGFR")
+      plot(best_model, add = TRUE, col = "red")
+      points.segmented (best_model)
+      lines.segmented (best_model, shift=TRUE)
+    }
+    
+    # Plot the alternative models
+    if (length(good_models_index) > 0) {
+      for (k in 1:length(good_models_index)) {
+        if (good_models_index[k] == 1){
+          plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+            main = paste("Linear model for", pat), 
+            xlab = "Date", ylab = "eGFR")
+          abline(best_model, col = "red", lwd = 2)
+        } else {
+          plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", 
+            main = paste(good_models_index[k] - 1, "changepoint(s) model for", pat),
+            xlab = "Date", ylab = "eGFR")
+          plot(models[[good_models_index[k]]], add = TRUE, col = "red")
+          points.segmented (models[[good_models_index[k]]])
+          lines.segmented (models[[good_models_index[k]]], shift=TRUE)
+          }
+      }
+      
+      # 3.3) Allowing the user to select a preferred model
+      repeat {
+        choice <- readline(prompt = paste(
+          "Based on AIC values, all of these models are plausible. Enter a number from 1 to", 
+          length(good_models_index) + 1, "to choose the model that you prefer.\n",
+          "Count from left to right, from top to bottom. 1 represents the model in the (top-)left corner, and", 
+          length(good_models_index) + 1, "is the (bottom-)right model.\n"
+        ))
+        
+        choice <- as.numeric(choice)
+        
+        if (!is.na(choice) && is.numeric(choice)) {
+          if (choice == 1) {
+            cat("You've chosen the first model\n")
+            break
+          } else if (choice >= 2 && choice <= length(good_models_index) + 1) {
+            best_model <- models[[good_models_index[(choice - 1)]]]
+            cat("You've chosen model number", choice, "\n")
+            break
+          }
+        }
+        
+        cat("Invalid choice. Please enter a number from 1 to", length(good_models_index) + 1, "\n")
+      }
+    }
+    
+    # Reset plotting layout to default
+    par(mfrow = c(1, 1))
+    
+    # 3.4) Extracting the best slope from the selected model
+    
+    # If a simple lm (initial model) shows the best fit, we calculate it's slope
+    if (identical(best_model, models[[1]])) {
+      coefficients <- coef(best_model)
+      best_slope <- coefficients[2]
+      print(paste("The best model for", pat, "is a linear regeression. It's slope =", best_slope))
+      
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", main = paste("Linear Regression model for", pat), xlab = "Date", ylab = "eGFR")
+      abline(initial_model, col = "red", lwd = 2) 
+      
+      # 3.5) Confirming the selected slope with the user
+      repeat {
+        continue <- readline(prompt = paste(
+          " If you agree, press Enter to continue. If you want to avoid this patient, press 'n'.\n",
+          "If you want to break the cycle, press Esc.\n\n"
+        ))
+        
+        if (tolower(continue) == "n") {
+          excluded_patients <- c(excluded_patients, pat)
+          cat("Patient", pat, "is not included in the final dataset.\n")
+          break
+        } else if ((continue)==""){
+          # Store extracted data
+          new_row <- data.frame(patient = pat, slope = best_slope)
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          break
+        }
+      }
+      
+      # If the best model has changepoints, extract all segment slopes 
+    } else { 
+      all_slopes <- as.data.frame(slope(best_model))
+      colnames(all_slopes) <- c("Est.", "St.Err.", "t value", "CI(95%).l", "CI(95%).u")
+      print(all_slopes)
+      
+      # Automatically pick the steepest (most negative) slope
+      best_slope <- min(all_slopes$Est.)
+      min_index <- which.min(all_slopes$Est.)
+      min_row_name <- rownames(all_slopes)[min_index]
+      
+      print(paste("The slope that you need for", pat, "is probably", min_row_name, best_slope))
+      
+      plot(current_pat$date, current_pat$eGFR, pch = 16, col = "blue", main = paste("Segmented Model for", pat), xlab = "Date", ylab = "eGFR")
+      plot(best_model, add = TRUE, col = "red")
+      points.segmented (best_model)
+      lines.segmented (best_model, shift=TRUE)
+      
+      # 3.5) Confirming the selected slope with the user
+      
+      repeat {
+        continue <- readline(prompt = paste(
+          " If you agree, press Enter to continue. If you want to avoid this patient, press 'n'.\n",
+          "If you want to choose another slope, enter the number from 1 to", nrow(all_slopes), "\n",
+          "If you want to break the cycle, press Esc.\n\n"
+        ))
+        
+        if (tolower(continue) == "n") {
+          # We exclude the patient
+          excluded_patients <- c(excluded_patients, pat)
+          cat("Patient", pat, "is not included in the final dataset.\n")
+          break
+          
+        } else if (as.integer(continue) %in% 2:nrow(all_slopes)) {
+          continue <- as.integer(continue)
+          # Extract changepoint date and CI bounds as dates
+          changepoint_dates <- as.Date(confint.segmented(best_model))
+          # Store extracted data
+          new_row <- data.frame(
+            patient = pat, 
+            # Store the slope value and its 95% confidence intervals  
+            slope = all_slopes[continue, 1],
+            slope_CI95_lower = all_slopes[continue, 4],
+            slope_CI95_upper = all_slopes[continue, 5],
+            # Store the changepoint at the beginning of the chosen line
+            changepoint_date = changepoint_dates[(continue-1)], 
+            # Store the 95% confidence intervals of the changepoint
+            changepoint_CI95_lower = changepoint_dates[(continue-1)+(nrow(all_slopes)-1)], 
+            changepoint_CI95_upper = changepoint_dates[(continue-1)+2*(nrow(all_slopes)-1)],
+            # Calculate predicted eGFR value for the predicted changepoint 
+            predicted_eGFR_for_changepoint = predict (best_model, data.frame(date = changepoint_dates[(continue-1)]))
+          )
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the slope number", continue, "for patient", pat, "\n\n")
+          break
+          
+        } else if (min_index!=1 && (continue)==""){
+          # Otherwise, add the automatically selected slope to the final dataset
+          # Extract changepoint date and CI bounds as dates
+          changepoint_dates <- as.Date(confint.segmented(best_model))
+          new_row <- data.frame(
+            patient = pat, 
+            # Store the slope value and its 95% confidence intervals  
+            slope = all_slopes[min_index, 1],
+            slope_CI95_lower = all_slopes[min_index, 4],
+            slope_CI95_upper = all_slopes[min_index, 5],
+            # Store the changepoint at the beginning of the chosen line
+            changepoint_date = changepoint_dates[(min_index-1)], 
+            # Store the 95% confidence intervals of the changepoint
+            changepoint_CI95_lower = changepoint_dates[(min_index-1)+(nrow(all_slopes)-1)], 
+            changepoint_CI95_upper = changepoint_dates[(min_index-1)+2*(nrow(all_slopes)-1)],
+            # Calculate predicted eGFR value for the predicted changepoint 
+            predicted_eGFR_for_changepoint = predict (best_model, data.frame(date = changepoint_dates[(min_index-1)]))
+          )
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the", min_row_name, "for patient", pat, "\n\n")
+          break
+          
+        } else if ((continue)=="1" | (min_index==1 && (continue)=="") ){
+          # If a user picks the first slope in a segmented model, we store only the slope value
+          new_row <- data.frame(patient = pat, slope = all_slopes[1, 1])
+          changepoint_summary <- bind_rows(changepoint_summary, new_row)
+          cat("You've chosen the slope number 1 for patient", pat, "\n\n")
+          break
+        }
+      }
+    }
+  }, error = function(e) {
+    cat("ERROR:", conditionMessage(e), "\n")
+  })
+```
+
+\
